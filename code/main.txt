@@ -1,0 +1,201 @@
+"""
+receptor standard deviations
+"""
+
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from nilearn.datasets import fetch_atlas_schaefer_2018
+from neuromaps.parcellate import Parcellater
+from netneurotools import datasets, plotting
+from scipy.stats import zscore, spearmanr
+import pyvista as pv
+import matplotlib.cm as cm
+
+
+def plot_subcortex(data, atlas_rois, hemi_labels, cmap="plasma",
+                   vmin=None, vmax=None, outpath=None):
+
+    assert len(data) == len(atlas_rois), \
+        "Data length must match number of ROIs"
+
+    views = {
+        "Right Lateral": ("zy", (0, 0, -1)),
+        "Left Lateral": ("yz", (0, 0, -1)),
+        "Right Medial": ("yz", (0, 0, -1)),
+        "Left Medial": ("zy", (0, 0, -1)),
+    }
+
+    plotters = []
+    for view_name, (cam_pos, up_dir) in views.items():
+        hemi = 'R' if 'Right' in view_name else 'L'
+        pl = pv.Plotter(off_screen=True, window_size=(512, 512))
+        for i, (roi, hem) in enumerate(zip(atlas_rois, hemi_labels)):
+            if hem != hemi:
+                continue
+            color = cm.get_cmap(cmap)((data[i] - (vmin or np.min(data))) /
+                                      ((vmax or np.max(data))
+                                       - (vmin or np.min(data))))
+            if np.isnan(data[i]):
+                color = [0.7, 0.7, 0.7]
+            pl.add_mesh(roi, color=color[:3])
+        pl.camera_position = cam_pos
+        pl.camera.up = up_dir
+        plotters.append(pl)
+
+    # Render all views and combine into 2x2 panel
+    imgs = [pl.screenshot(return_img=True) for pl in plotters]
+    fig, axs = plt.subplots(2, 2, figsize=(10, 10))
+    axs = axs.ravel()
+    for ax, img, title in zip(axs, imgs, views.keys()):
+        ax.imshow(img)
+        ax.axis("off")
+    plt.tight_layout()
+
+    if outpath is not None:
+        plt.savefig(outpath)
+
+
+"""
+set up
+"""
+
+path = "/home/jhansen/gitrepos/hansen_receptor-variability/"
+
+filenames = [path + 'data/PET_volumes/5HT1a_cumi101_hc8_beliveau',
+             path + 'data/PET_volumes/5HT1b_az_hc36_beliveau',
+             path + 'data/PET_volumes/5HT2a_cimbi_hc29_beliveau',
+             path + 'data/PET_volumes/5HT4_sb20_hc59_beliveau',
+             path + 'data/PET_volumes/5HTT_dasb_hc100_beliveau',
+             path + 'data/PET_volumes/5HTT_madam_hc49_nummenmaa',
+             path + 'data/PET_volumes/CB1_fmpepVt2_hc20_nummenmaa',
+             path + 'data/PET_volumes/D2_raclopride_hc16_tuominen',
+             path + 'data/PET_volumes/D2_raclopride_hc47_nummenmaa',
+             path + 'data/PET_volumes/D2_fallypride_hc49_jaworska',
+             path + 'data/PET_volumes/DOPA_fdopa_hc17_nummenmaa',
+             path + 'data/PET_volumes/GABAa1_ro154513_hc23_chang',
+             path + 'data/PET_volumes/GABAa5_ro154513_hc23_chang',
+             path + 'data/PET_volumes/GABAabz_flumazenil_hc16_norgaard',
+             path + 'data/PET_volumes/MOR_carfentanil_hc86_nummenmaa',
+             path + 'data/PET_volumes/mGluR5_ABP688_hc27_dubois',
+             path + 'data/PET_volumes/mGluR5_ABP688_hc73_smart',
+             path + 'data/PET_volumes/NMDA_ge179_hc29_galovic',
+             path + 'data/PET_volumes/SV2A_ucbj_hc32_nummenmaa',
+             path + 'data/PET_volumes/VAChT_feobv_hc25_tuominen']
+
+# load if already saved:
+data = pd.read_pickle(path + 'data/mean_var_dataframes.pkl')
+(receptor_means, receptor_sds, cv,
+ receptor_means_tian, receptor_sds_tian, cv_tian) = (
+    data['mean_schaefer'], data['sd_schaefer'], data['cv_schaefer'],
+    data['mean_tian'], data['sd_tian'], data['cv_tian']
+)
+
+"""
+fetch and parcellate mean and sd images
+"""
+
+# Tian S4 (subcortex)
+parcellater_tian = Parcellater(path + 'data/Tian_Subcortex_S4_3T_1mm.nii.gz',
+                               'MNI152')
+with open(path+'data/Tian_Subcortex_S4_3T_label.txt', 'r') as f:
+    tianlabels = [line.strip() for line in f]
+
+parcellated_mean_tian = {}
+parcellated_sd_tian = {}
+cv_tian = {}
+
+for receptor in filenames:
+    name = receptor.split('/')[-1].split('.')[0]
+
+    # Parcellate mean and std images
+    mean_vals = parcellater_tian.fit_transform(receptor + '_mean.nii.gz',
+                                               'MNI152', True).squeeze()
+    std_vals = parcellater_tian.fit_transform(receptor + '_sd.nii.gz',
+                                              'MNI152', True).squeeze()
+
+    # Step 1: set values < 0 to 0
+    mean_vals[mean_vals < 0] = 0
+
+    # Step 2: if any values are < 0.1, set the bottom 5% to 0
+    if np.any(mean_vals < 0.1):
+        threshold = np.percentile(mean_vals, 5)
+        mean_vals[mean_vals < threshold] = 0
+
+    # Save cleaned results
+    parcellated_mean_tian[name] = mean_vals
+    parcellated_sd_tian[name] = std_vals
+
+    # Compute CV: std / mean, but set CV to nan if mean == 0
+    cv_vals = np.full_like(mean_vals, np.nan)
+    nonzero_mask = mean_vals != 0
+    cv_vals[nonzero_mask] = std_vals[nonzero_mask] / mean_vals[nonzero_mask]
+    cv_tian[name] = cv_vals
+
+# make into dataframe
+receptor_means = pd.DataFrame(parcellated_mean, index=schaefer['labels'])
+receptor_sds = pd.DataFrame(parcellated_sd, index=schaefer['labels'])
+cv = pd.DataFrame(cv, index=schaefer['labels'])
+
+receptor_means_tian = pd.DataFrame(parcellated_mean_tian, index=tianlabels)
+receptor_sds_tian = pd.DataFrame(parcellated_sd_tian, index=tianlabels)
+cv_tian = pd.DataFrame(cv_tian,
+                       index=tianlabels)
+
+# save out
+data = {
+    'mean_schaefer': receptor_means,
+    'sd_schaefer': receptor_sds,
+    'cv_schaefer': cv,
+    'mean_tian': receptor_means_tian,
+    'sd_tian': receptor_sds_tian,
+    'cv_tian': cv_tian
+}
+pd.to_pickle(data, path+'data/mean_var_dataframes.pkl')
+
+"""
+plot subcortex
+"""
+
+M = receptor_means_tian.copy()
+S = receptor_sds_tian.copy()
+C = cv_tian.copy()
+
+atlas = pv.read(path+'data/Tian_Subcortex_S4_3T_1mm.nii.gz')
+atlas_rois = [atlas.image_threshold([i, i]).contour(
+    [1]).smooth_taubin(n_iter=25, pass_band=0.01, non_manifold_smoothing=True)
+              for i in range(1, 55)]
+hemi_labels = ['R' if i < 28 else 'L' for i in range(len(atlas_rois))]
+
+for key, value in M.items():
+    plot_subcortex(
+        data=value,
+        atlas_rois=atlas_rois,
+        cmap='plasma',
+        hemi_labels=hemi_labels,
+        vmin=value.min(),
+        vmax=value.max(),
+        outpath=path+'figures/png/tianS4/surface_' + key + '_means.png'
+        )
+
+for key, value in S.items():
+    plot_subcortex(
+        data=value,
+        atlas_rois=atlas_rois,
+        cmap='plasma',
+        hemi_labels=hemi_labels,
+        vmin=value.min(),
+        vmax=value.max(),
+        outpath=path+'figures/png/tianS4/surface_' + key + '_sds.png'
+        )
+
+for key, value in C.items():
+    plot_subcortex(
+        data=value,
+        atlas_rois=atlas_rois,
+        cmap='plasma',
+        hemi_labels=hemi_labels,
+        vmin=value.min(),
+        vmax=value.max(),
+        outpath=path+'figures/png/tianS4/surface_' + key + '_cv.png'
+        )
